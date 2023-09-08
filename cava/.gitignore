@@ -1,0 +1,13 @@
+.idea
+.idea/*
+*.pyc
+*.swp
+
+lib.h
+lib.c
+driver.c
+worker.c
+*.guesses
+*.log
+
+*_nw

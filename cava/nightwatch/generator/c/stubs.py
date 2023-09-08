@@ -1,0 +1,254 @@
+from typing import List, Union
+
+from nightwatch import location, term
+from nightwatch.c_dsl import Expr, ExprOrStr
+from nightwatch.generator import generate_requires
+from nightwatch.generator.c.buffer_handling import compute_total_size
+from nightwatch.generator.c.caller import compute_argument_value, attach_for_argument
+from nightwatch.generator.c.instrumentation import (
+    timing_code_guest,
+    report_alloc_resources,
+    report_consume_resources,
+    gen_time_stamp,
+)
+from nightwatch.generator.c.util import AllocList
+from nightwatch.generator.common import nl, pack_struct
+from nightwatch.model import Function, lines
+
+
+def function_implementation(f: Function, enabled_opts: List[str] = None) -> Union[str, Expr]:
+    """
+    Generate a stub function which sends the appropriate CALL command over the
+    channel.
+    :param f: The function to generate a stub for.
+    :return: A C function definition (as a string or Expr)
+    """
+    with location(f"at {term.yellow(str(f.name))}", f.location):
+        if f.return_value.type.buffer:
+            forge_success = "#error Async returned buffers are not implemented."
+        elif f.return_value.type.is_void:
+            forge_success = "return;"
+        elif f.return_value.type.success is not None:
+            forge_success = f"return {f.return_value.type.success};"
+        else:
+            forge_success = """abort_with_reason("Cannot forge success without a success value for the type.");"""
+
+        if f.return_value.type.is_void:
+            return_statement = """
+                free(__call_record);
+                return;
+            """.strip()
+        else:
+            return_statement = f"""
+                {f.return_value.declaration};
+                {f.return_value.name} = __call_record->{f.return_value.name};
+                free(__call_record);
+                return {f.return_value.name};
+            """.strip()
+
+        is_async = ~Expr(f.synchrony).equals("NW_SYNC")
+
+        alloc_list = AllocList(f)
+
+        if enabled_opts:
+            # Enable batching optimization: the APIs are batched into a `__do_batch_emit` call.
+            if "batching" in enabled_opts:
+                send_code = f"""
+                    auto guest_context = ava::GuestContext::instance();
+                    guest_context->guest_cmd_batching_queue_->enqueue_cmd((struct command_base*)__cmd, __chan, {int(is_async.is_true())});
+                    """.strip()
+                if f.name == "__do_batch_emit":
+                    send_code = """
+                    command_channel_send_command(__chan, (struct command_base*)__cmd);
+                    """.strip()
+        else:
+            send_code = """
+                command_channel_send_command(__chan, (struct command_base*)__cmd);
+            """.strip()
+
+        collect_stats = ""
+        func_name = str(f.name)
+        if is_async.is_true():
+            func_name = f"{str(f.name)}_async"
+        if f.generate_stats_code:
+            collect_stats = f"""
+            #ifdef __AVA_ENABLE_STAT
+            fmt::memory_buffer output;
+            fmt::format_to(output, \"GuestlibStat {func_name}, {{}}\\n\",
+                gsl::narrow_cast<int32_t>({str(f.name)}_end_ts - {str(f.name)}_beg_ts));
+            ava::guest_write_stats(output.data(), output.size());
+            #endif
+            """.strip()
+
+        return_code = is_async.if_then_else(
+            f"""
+            {gen_time_stamp(str(f.name)+"_end", f.generate_stats_code)}
+            {timing_code_guest("after_send", str(f.name), f.generate_timing_code)}
+            {collect_stats}
+            {forge_success}
+            """,
+            f"""
+                shadow_thread_handle_command_until(
+                  common_context->nw_shadow_thread_pool, __call_record->__call_complete);
+                {gen_time_stamp(str(f.name)+"_end", f.generate_stats_code)}
+                {timing_code_guest("after_send", str(f.name), f.generate_timing_code)}
+                {collect_stats}
+                {return_statement}
+            """.strip(),
+        )
+
+        return f"""
+        EXPORTED {(f.api.export_qualifier + " ") if f.api.export_qualifier else ""}{f.return_value.type.spelling} {f.name}(
+                    {", ".join(a.original_declaration for a in f.real_arguments)}) {{
+            {gen_time_stamp(str(f.name)+"_beg", f.generate_stats_code)}
+            {timing_code_guest("before_marshal", str(f.name), f.generate_timing_code)}
+
+            const int ava_is_in = 1, ava_is_out = 0;
+            intptr_t __call_id = ava_get_call_id(&__ava_endpoint);
+            auto common_context = ava::CommonContext::instance();
+
+            #ifdef AVA_BENCHMARKING_MIGRATE
+            if (__ava_endpoint.migration_call_id >= 0 && __call_id ==
+            __ava_endpoint.migration_call_id) {{
+                printf("start live migration at call_id %d\\n", __call_id);
+                __ava_endpoint.migration_call_id = -2;
+                start_live_migration(__chan);
+            }}
+            #endif
+
+            {alloc_list.alloc}
+
+            {"".join(compute_argument_value(a) for a in f.implicit_arguments)}
+
+            {compute_total_size(f.arguments, lambda a: a.input)}
+            struct {f.call_spelling}* __cmd = (struct {f.call_spelling}*)command_channel_new_command(
+                __chan, sizeof(struct {f.call_spelling}), __total_buffer_size);
+            __cmd->base.api_id = {f.api.number_spelling};
+            __cmd->base.command_id = {f.call_id_spelling};
+            __cmd->base.thread_id = shadow_thread_id(common_context->nw_shadow_thread_pool);
+            __cmd->base.original_thread_id = __cmd->base.thread_id;
+
+            __cmd->__call_id = __call_id;
+
+            {nl.join(a.declaration + ";" for a in f.logue_declarations)}
+            {{
+                {"".join(attach_for_argument(a, "__cmd") for a in f.implicit_arguments)}
+                {lines(f.prologue)}
+                {"".join(attach_for_argument(a, "__cmd") for a in f.real_arguments)}
+            }}
+
+            struct {f.call_record_spelling}* __call_record =
+                (struct {f.call_record_spelling}*)calloc(1, sizeof(struct {f.call_record_spelling}));
+            {pack_struct("__call_record", f.arguments + f.logue_declarations, "->")}
+            __call_record->__call_complete = 0;
+            __call_record->__handler_deallocate = {is_async};
+            ava_add_call(&__ava_endpoint, __call_id, __call_record);
+
+            {timing_code_guest("before_send_command", str(f.name), f.generate_timing_code)}
+
+            {send_code}
+
+            {alloc_list.dealloc}
+
+            {return_code}
+        }}
+        """
+
+
+def unsupported_function_implementation(f: Function) -> str:
+    """
+    Generate a stub function which simply fails with an "Unsupported" message.
+    :param f: The unsupported function.
+    :return: A C function definition.
+    """
+    with location(f"at {term.yellow(str(f.name))}", f.location):
+        return f"""
+        EXPORTED {(f.api.export_qualifier + " ") if f.api.export_qualifier else ""}{f.return_value.type.spelling} {f.name}(
+                    {", ".join(a.declaration for a in f.real_arguments)}) {{
+            abort_with_reason("Unsupported API function: {f.name}");
+        }}
+        """
+
+
+def function_wrapper(f: Function) -> str:
+    """
+    Generate a wrapper function for f which takes the arguments of the function, executes the "logues", and
+    calls the function.
+    :param f: A function.
+    :return: A C static function definition.
+    """
+    with location(f"at {term.yellow(str(f.name))}", f.location):
+        if f.return_value.type.is_void:
+            declare_ret = ""
+            capture_ret = ""
+            return_statement = "return;"
+        else:
+            declare_ret = f"{f.return_value.type.nonconst.attach_to(f.return_value.name)};"
+            capture_ret = f"{f.return_value.name} = "
+            return_statement = f"return {f.return_value.name};"
+        if f.disable_native:
+            # This works for both normal functions and callbacks because the
+            # difference between the two is in the call, which is not emitted in
+            # this case anyway.
+            capture_ret = ""
+            call_code = ""
+            callback_unpack = ""
+        elif not f.callback_decl:
+            # Normal call
+            call_code = (
+                f"""({f.return_value.type.nonconst.spelling})"""
+                f"""({f.name}({", ".join(a.name for a in f.real_arguments)}))"""
+            )
+            callback_unpack = ""
+        else:
+            # Indirect call (callback)
+            try:
+                (userdata_arg,) = [a for a in f.arguments if a.userdata]
+            except ValueError:
+                generate_requires(
+                    False, "ava_callback_decl function must have exactly one argument annotated with " "ava_userdata."
+                )
+            call_code = f"""__target_function({", ".join(a.name for a in f.real_arguments)})"""
+            callback_unpack = f"""
+                {f.type.attach_to("__target_function")};
+                __target_function = {f.type.cast_type(f"((struct ava_callback_user_data*){userdata_arg.name})->function_pointer")};
+                {userdata_arg.name} = ((struct ava_callback_user_data*){userdata_arg.name})->userdata;
+            """
+
+        return f"""
+        static {f.return_value.type.spelling} __wrapper_{f.name}({", ".join(a.declaration for a in f.arguments)}) {{
+            {callback_unpack}\
+            {lines(a.declaration + ";" for a in f.logue_declarations)}\
+            {lines(f.prologue)}\
+            {{
+            {declare_ret}
+            {capture_ret}{call_code};
+            {lines(f.epilogue)}
+
+            /* Report resources */
+            {lines(report_alloc_resources(arg) for arg in f.arguments)}
+            {report_alloc_resources(f.return_value)}
+            {report_consume_resources(f)}
+
+            {return_statement}
+            }}
+        }}
+        """.strip()
+
+
+def call_function_wrapper(f: Function) -> ExprOrStr:
+    """
+    Call a functions wrapper with arguments that are already in scope.
+    :param f: The function to call.
+    :return: A C statement to perform the call and capture the return value.
+    """
+    if f.return_value.type.is_void:
+        capture_ret = ""
+    else:
+        capture_ret = (
+            f"{f.return_value.type.nonconst.attach_to(f.return_value.name)}; "
+            f"{f.return_value.name} = ({f.return_value.type.nonconst.spelling})"
+        )
+    return f"""
+        {capture_ret}__wrapper_{f.name}({", ".join(f"({a.type.spelling}){a.name}" for a in f.arguments)});
+    """.strip()
