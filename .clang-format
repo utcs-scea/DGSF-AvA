@@ -1,0 +1,13 @@
+# Full configurations:
+# https://clang.llvm.org/docs/ClangFormatStyleOptions.html
+
+BasedOnStyle: Google
+ColumnLimit: 120
+DerivePointerAlignment: false
+IndentCaseLabels: false
+PointerAlignment: Right
+IndentWidth: 2
+ConstructorInitializerIndentWidth: 4
+ContinuationIndentWidth: 4
+Cpp11BracedListStyle: true
+MaxEmptyLinesToKeep: 1

@@ -1,0 +1,38 @@
+[submodule "llvm"]
+	path = llvm
+	url = https://github.com/utcs-scea/ava-llvm.git
+	branch = llvmorg-7.1.0
+  ignore = dirty
+[submodule "third_party/plog"]
+	path = third_party/plog
+	url = https://github.com/SergiusTheBest/plog.git
+  branch = 1.1.5
+  ignore = dirty
+[submodule "third_party/fmt"]
+	path = third_party/fmt
+	url = https://github.com/fmtlib/fmt.git
+  branch = 7.1.3
+  ignore = dirty
+[submodule "third_party/abseil-cpp"]
+	path = third_party/abseil-cpp
+	url = https://github.com/abseil/abseil-cpp.git
+  branch = 20210324.1
+  ignore = dirty
+[submodule "third_party/GSL"]
+	path = third_party/GSL
+	url = https://github.com/microsoft/GSL.git
+  branch = v3.1.0
+  ignore = dirty
+[submodule "third_party/libconfig"]
+	path = third_party/libconfig
+	url = https://github.com/hyperrealm/libconfig.git
+  branch = 5ea446216255e90bfdbf646a06404e37651f192b
+  ignore = dirty
+[submodule "third_party/glib"]
+	path = third_party/glib
+	url = https://gitlab.gnome.org/GNOME/glib.git
+  branch = 2.56.3
+  ignore = dirty
+[submodule "third_party/libzmq"]
+	path = third_party/libzmq
+	url = https://github.com/zeromq/libzmq.git
